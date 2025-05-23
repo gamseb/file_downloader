@@ -81,10 +81,10 @@ class MagnetDownloadManager:
         self.progress = 0
         self.error = None
         self.start_time = datetime.now()
-        self.rd_manager = RealDebridManager(REAL_DEBRID_API_KEY)
         self.torrent_id = None
         self.download_links = []
         self.files = []
+        self.rd_manager = RealDebridManager(REAL_DEBRID_API_KEY)
 
     def process_magnet(self):
         """Process magnet link through Real-Debrid"""
@@ -137,6 +137,62 @@ class MagnetDownloadManager:
         except Exception as e:
             self.status = 'failed'
             self.error = str(e)
+
+
+class DownloadManager:
+    def __init__(self, url, download_id):
+        self.url = url
+        self.download_id = download_id
+        self.filename = self._get_filename_from_url(url)
+        self.filepath = os.path.join(DOWNLOAD_FOLDER, f"{download_id}_{self.filename}")
+        self.status = 'pending'
+        self.progress = 0
+        self.error = None
+        self.start_time = datetime.now()
+        self.file_size = 0
+        self.downloaded_size = 0
+
+    def _get_filename_from_url(self, url):
+        """Extract filename from URL or generate one"""
+        parsed = urlparse(url)
+        filename = os.path.basename(unquote(parsed.path))
+        if not filename or '.' not in filename:
+            # Generate filename from URL hash
+            filename = f"download_{hashlib.md5(url.encode()).hexdigest()[:8]}.bin"
+        return filename
+
+    def download(self):
+        """Download file in chunks with progress tracking"""
+        try:
+            self.status = 'downloading'
+            response = requests.get(self.url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            # Get file size if available
+            self.file_size = int(response.headers.get('content-length', 0))
+
+            with open(self.filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        self.downloaded_size += len(chunk)
+                        if self.file_size > 0:
+                            self.progress = int((self.downloaded_size / self.file_size) * 100)
+
+            self.status = 'completed'
+            self.progress = 100
+
+        except requests.exceptions.RequestException as e:
+            self.status = 'failed'
+            self.error = str(e)
+            # Clean up partial file
+            if os.path.exists(self.filepath):
+                os.remove(self.filepath)
+        except Exception as e:
+            self.status = 'failed'
+            self.error = f"Unexpected error: {str(e)}"
+            if os.path.exists(self.filepath):
+                os.remove(self.filepath)
 
     def __init__(self, url, download_id):
         self.url = url
@@ -206,7 +262,8 @@ def start_download(url):
             'status': manager.status,
             'progress': manager.progress,
             'start_time': manager.start_time.isoformat(),
-            'manager': manager
+            'manager': manager,
+            'type': 'direct'
         }
 
     # Start download in background thread
