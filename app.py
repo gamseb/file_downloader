@@ -4,6 +4,7 @@ import time
 import threading
 import requests
 import hashlib
+import json
 from flask import Flask, render_template, request, jsonify, send_file
 from datetime import datetime
 from urllib.parse import urlparse, unquote
@@ -16,6 +17,7 @@ app = Flask(__name__)
 
 # Configuration
 DOWNLOAD_FOLDER = 'downloads'
+INDEX_FILE = os.path.join(DOWNLOAD_FOLDER, 'index.json')
 CHUNK_SIZE = 8192  # 8KB chunks for downloading large files
 REAL_DEBRID_API_KEY = os.getenv('REAL_DEBRID_API_KEY')
 REAL_DEBRID_BASE_URL = 'https://api.real-debrid.com/rest/1.0'
@@ -26,6 +28,104 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 # Store download status and file information
 downloads = {}
 download_lock = threading.Lock()
+
+
+def save_downloads_index():
+    """Save downloads dictionary to index file"""
+    try:
+        with download_lock:
+            # Create serializable version of downloads (without manager objects)
+            serializable_downloads = {}
+            for download_id, info in downloads.items():
+                manager = info['manager']
+                serializable_downloads[download_id] = {
+                    'id': download_id,
+                    'url': info['url'],
+                    'filename': info['filename'],
+                    'status': manager.status,
+                    'progress': manager.progress,
+                    'error': manager.error,
+                    'start_time': info['start_time'],
+                    'type': info.get('type', 'direct'),
+                    'file_size': getattr(manager, 'file_size', 0),
+                    'downloaded_size': getattr(manager, 'downloaded_size', 0),
+                    'filepath': getattr(manager, 'filepath', ''),
+                    # Magnet-specific fields
+                    'torrent_id': getattr(manager, 'torrent_id', None),
+                    'download_links': getattr(manager, 'download_links', []),
+                    'files': getattr(manager, 'files', [])
+                }
+
+            with open(INDEX_FILE, 'w') as f:
+                json.dump(serializable_downloads, f, indent=2, default=str)
+
+    except Exception as e:
+        print(f"Error saving downloads index: {e}")
+
+
+def load_downloads_index():
+    """Load downloads dictionary from index file"""
+    global downloads
+
+    if not os.path.exists(INDEX_FILE):
+        return
+
+    try:
+        with open(INDEX_FILE, 'r') as f:
+            saved_downloads = json.load(f)
+
+        with download_lock:
+            for download_id, info in saved_downloads.items():
+                # Recreate manager objects based on type and status
+                if info.get('type') == 'magnet':
+                    manager = MagnetDownloadManager(info['url'], download_id)
+                    manager.torrent_id = info.get('torrent_id')
+                    manager.download_links = info.get('download_links', [])
+                    manager.files = info.get('files', [])
+                else:
+                    manager = DownloadManager(info['url'], download_id)
+                    manager.file_size = info.get('file_size', 0)
+                    manager.downloaded_size = info.get('downloaded_size', 0)
+
+                # Restore manager state
+                manager.status = info['status']
+                manager.progress = info['progress']
+                manager.error = info.get('error')
+                manager.filename = info['filename']
+                if info.get('filepath'):
+                    manager.filepath = info['filepath']
+
+                # Restore start time
+                try:
+                    manager.start_time = datetime.fromisoformat(info['start_time'])
+                except:
+                    manager.start_time = datetime.now()
+
+                downloads[download_id] = {
+                    'id': download_id,
+                    'url': info['url'],
+                    'filename': info['filename'],
+                    'status': manager.status,
+                    'progress': manager.progress,
+                    'start_time': info['start_time'],
+                    'manager': manager,
+                    'type': info.get('type', 'direct')
+                }
+
+                # Resume incomplete downloads automatically
+                if manager.status in ['downloading', 'processing', 'pending']:
+                    print(f"Resuming {info['type']} download: {info['filename']}")
+                    if info.get('type') == 'magnet':
+                        thread = threading.Thread(target=manager.process_magnet)
+                    else:
+                        thread = threading.Thread(target=manager.download)
+                    thread.daemon = True
+                    thread.start()
+
+        print(f"Loaded {len(saved_downloads)} downloads from index")
+
+    except Exception as e:
+        print(f"Error loading downloads index: {e}")
 
 
 class RealDebridManager:
@@ -113,10 +213,13 @@ class MagnetDownloadManager:
         """Process magnet link through Real-Debrid"""
         try:
             self.status = 'processing'
+            save_downloads_index()  # Save state change
 
-            # Add magnet to Real-Debrid
-            result = self.rd_manager.add_magnet(self.magnet_link)
-            self.torrent_id = result['id']
+            # Add magnet to Real-Debrid (skip if torrent_id already exists - resuming)
+            if not self.torrent_id:
+                result = self.rd_manager.add_magnet(self.magnet_link)
+                self.torrent_id = result['id']
+                save_downloads_index()  # Save torrent_id
 
             # Check status indefinitely - no timeout for long downloads
             check_count = 0
@@ -152,6 +255,7 @@ class MagnetDownloadManager:
 
                         self.status = 'ready'
                         self.progress = 100
+                        save_downloads_index()  # Save completion
                         break
                     elif torrent_status in ['magnet_error', 'error', 'virus']:
                         raise Exception(f"Torrent error: {torrent_status}")
@@ -186,6 +290,10 @@ class MagnetDownloadManager:
                             eta_str = f" - ETA: {self._format_time(eta_seconds)}"
 
                         self.error = f"Status: {torrent_status} - Progress: {progress}% - Seeders: {seeders} - Speed: {speed_str}{eta_str}"
+
+                        # Save progress periodically
+                        if check_count % 5 == 0:  # Save every 5 checks
+                            save_downloads_index()
                     else:
                         # Unknown status, continue waiting
                         self.error = f"Status: {torrent_status} - Check #{check_count}"
@@ -207,6 +315,7 @@ class MagnetDownloadManager:
         except Exception as e:
             self.status = 'failed'
             self.error = str(e)
+            save_downloads_index()  # Save failure state
 
     def _format_speed(self, bytes_per_second):
         """Format speed in human readable format"""
@@ -265,6 +374,14 @@ class DownloadManager:
         """Download file in chunks with progress tracking"""
         try:
             self.status = 'downloading'
+            save_downloads_index()  # Save state change
+
+            # Check if file already exists and get its size for resuming
+            resume_header = {}
+            if os.path.exists(self.filepath):
+                self.downloaded_size = os.path.getsize(self.filepath)
+                resume_header['Range'] = f'bytes={self.downloaded_size}-'
+                print(f"Resuming download from byte {self.downloaded_size}")
 
             # Try to establish connection with retries
             max_attempts = 120  # 10 minutes max (5 seconds between attempts)
@@ -272,7 +389,18 @@ class DownloadManager:
 
             for attempt in range(max_attempts):
                 try:
-                    response = requests.get(self.url, stream=True, timeout=30)
+                    response = requests.get(self.url, stream=True, timeout=30, headers=resume_header)
+
+                    # Handle partial content response
+                    if response.status_code == 206:  # Partial content
+                        print("Server supports resume - continuing download")
+                    elif response.status_code == 200 and resume_header:
+                        # Server doesn't support resume, start over
+                        print("Server doesn't support resume - starting over")
+                        self.downloaded_size = 0
+                        if os.path.exists(self.filepath):
+                            os.remove(self.filepath)
+
                     response.raise_for_status()
                     break
                 except requests.exceptions.ConnectionError as e:
@@ -290,14 +418,27 @@ class DownloadManager:
                 raise Exception("Failed to connect after all attempts")
 
             # Get file size if available
-            self.file_size = int(response.headers.get('content-length', 0))
+            content_length = response.headers.get('content-length')
+            if content_length:
+                if response.status_code == 206:
+                    # For partial content, add the range to existing downloaded size
+                    content_range = response.headers.get('content-range', '')
+                    if '/' in content_range:
+                        self.file_size = int(content_range.split('/')[-1])
+                else:
+                    self.file_size = int(content_length)
+
             self.error = None  # Clear any connection attempt messages
 
             # Download with timeout handling
             last_progress_time = time.time()
             stall_timeout = 300  # 5 minutes without progress
+            save_counter = 0
 
-            with open(self.filepath, 'wb') as f:
+            # Open file in append mode if resuming, write mode if starting fresh
+            mode = 'ab' if self.downloaded_size > 0 else 'wb'
+
+            with open(self.filepath, mode) as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
@@ -307,6 +448,11 @@ class DownloadManager:
 
                         # Reset stall timer on progress
                         last_progress_time = time.time()
+
+                        # Save progress periodically
+                        save_counter += 1
+                        if save_counter % 1000 == 0:  # Save every 1000 chunks
+                            save_downloads_index()
                     else:
                         # Check for stalled download
                         if time.time() - last_progress_time > stall_timeout:
@@ -314,72 +460,18 @@ class DownloadManager:
 
             self.status = 'completed'
             self.progress = 100
+            save_downloads_index()  # Save completion
 
         except requests.exceptions.RequestException as e:
             self.status = 'failed'
             self.error = str(e)
-            # Clean up partial file
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
+            save_downloads_index()
+            # Don't clean up partial file - allow resume
         except Exception as e:
             self.status = 'failed'
             self.error = f"Unexpected error: {str(e)}"
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
-
-    def __init__(self, url, download_id):
-        self.url = url
-        self.download_id = download_id
-        self.filename = self._get_filename_from_url(url)
-        self.filepath = os.path.join(DOWNLOAD_FOLDER, f"{download_id}_{self.filename}")
-        self.status = 'pending'
-        self.progress = 0
-        self.error = None
-        self.start_time = datetime.now()
-        self.file_size = 0
-        self.downloaded_size = 0
-
-    def _get_filename_from_url(self, url):
-        """Extract filename from URL or generate one"""
-        parsed = urlparse(url)
-        filename = os.path.basename(unquote(parsed.path))
-        if not filename or '.' not in filename:
-            # Generate filename from URL hash
-            filename = f"download_{hashlib.md5(url.encode()).hexdigest()[:8]}.bin"
-        return filename
-
-    def download(self):
-        """Download file in chunks with progress tracking"""
-        try:
-            self.status = 'downloading'
-            response = requests.get(self.url, stream=True, timeout=30)
-            response.raise_for_status()
-
-            # Get file size if available
-            self.file_size = int(response.headers.get('content-length', 0))
-
-            with open(self.filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        self.downloaded_size += len(chunk)
-                        if self.file_size > 0:
-                            self.progress = int((self.downloaded_size / self.file_size) * 100)
-
-            self.status = 'completed'
-            self.progress = 100
-
-        except requests.exceptions.RequestException as e:
-            self.status = 'failed'
-            self.error = str(e)
-            # Clean up partial file
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
-        except Exception as e:
-            self.status = 'failed'
-            self.error = f"Unexpected error: {str(e)}"
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
+            save_downloads_index()
+            # Don't clean up partial file - allow resume
 
 
 def start_download(url):
@@ -398,6 +490,8 @@ def start_download(url):
             'manager': manager,
             'type': 'direct'
         }
+
+    save_downloads_index()  # Save new download
 
     # Start download in background thread
     thread = threading.Thread(target=manager.download)
@@ -426,6 +520,8 @@ def start_magnet_download(magnet_link):
             'manager': manager,
             'type': 'magnet'
         }
+
+    save_downloads_index()  # Save new download
 
     # Start processing in background thread
     thread = threading.Thread(target=manager.process_magnet)
@@ -569,6 +665,7 @@ def delete_file(download_id):
         # Remove from downloads dict
         del downloads[download_id]
 
+    save_downloads_index()  # Save deletion
     return jsonify({'success': True})
 
 
@@ -633,6 +730,8 @@ def resume_torrent_monitoring(torrent_id):
                 'type': 'magnet'
             }
 
+        save_downloads_index()  # Save resumed download
+
         # Start monitoring in background thread
         thread = threading.Thread(target=manager.process_magnet)
         thread.daemon = True
@@ -644,6 +743,10 @@ def resume_torrent_monitoring(torrent_id):
 
 
 if __name__ == '__main__':
+    # Load existing downloads on startup
+    print("Loading downloads index...")
+    load_downloads_index()
+
     # For production on Debian, you might want to use gunicorn instead
     # Example: gunicorn -w 4 -b 0.0.0.0:8000 app:app
     app.run(debug=True, host='0.0.0.0', port=5000)
