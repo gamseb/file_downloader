@@ -33,6 +33,28 @@ class RealDebridManager:
         self.api_key = api_key
         self.headers = {'Authorization': f'Bearer {api_key}'}
 
+    def check_availability(self, magnet_link):
+        """Check if torrent is available on Real-Debrid"""
+        try:
+            response = requests.post(
+                f'{REAL_DEBRID_BASE_URL}/torrents/instantAvailability',
+                headers=self.headers,
+                data={'hash': self._extract_hash_from_magnet(magnet_link)}
+            )
+            response.raise_for_status()
+            result = response.json()
+            # If result is not empty, torrent is cached
+            return len(result) > 0
+        except:
+            # If check fails, proceed anyway
+            return None
+
+    def _extract_hash_from_magnet(self, magnet_link):
+        """Extract info hash from magnet link"""
+        import re
+        match = re.search(r'btih:([a-fA-F0-9]+)', magnet_link)
+        return match.group(1).lower() if match else None
+
     def add_magnet(self, magnet_link):
         """Add magnet link to Real-Debrid"""
         response = requests.post(
@@ -95,48 +117,125 @@ class MagnetDownloadManager:
             result = self.rd_manager.add_magnet(self.magnet_link)
             self.torrent_id = result['id']
 
-            # Wait for torrent to be ready
-            max_attempts = 60  # 5 minutes max wait
-            for attempt in range(max_attempts):
-                torrent_info = self.rd_manager.get_torrent_info(self.torrent_id)
-
-                if torrent_info['status'] == 'downloaded':
-                    # Select all files
-                    self.rd_manager.select_files(self.torrent_id)
-
-                    # Get updated torrent info with links
+            # Check status indefinitely - no timeout for long downloads
+            check_count = 0
+            while True:
+                try:
                     torrent_info = self.rd_manager.get_torrent_info(self.torrent_id)
-                    self.files = torrent_info.get('files', [])
+                    check_count += 1
 
-                    # Extract filename from torrent
-                    if self.files:
-                        self.filename = torrent_info.get('filename', f"magnet_{self.download_id}")
+                    # Update status message based on torrent status
+                    torrent_status = torrent_info.get('status', 'unknown')
 
-                    # Get unrestricted links
-                    links = torrent_info.get('links', [])
-                    for link in links:
-                        unrestricted = self.rd_manager.unrestrict_link(link)
-                        self.download_links.append({
-                            'filename': unrestricted.get('filename', 'unknown'),
-                            'download': unrestricted.get('download'),
-                            'filesize': unrestricted.get('filesize', 0)
-                        })
+                    if torrent_status == 'downloaded':
+                        # Select all files
+                        self.rd_manager.select_files(self.torrent_id)
 
-                    self.status = 'ready'
-                    self.progress = 100
-                    break
-                elif torrent_info['status'] in ['magnet_error', 'error', 'dead']:
-                    raise Exception(f"Torrent error: {torrent_info['status']}")
-                else:
-                    # Update progress based on seeders
-                    self.progress = min(attempt * 100 // max_attempts, 99)
-                    time.sleep(5)
-            else:
-                raise Exception("Timeout waiting for torrent to complete")
+                        # Get updated torrent info with links
+                        torrent_info = self.rd_manager.get_torrent_info(self.torrent_id)
+                        self.files = torrent_info.get('files', [])
+
+                        # Extract filename from torrent
+                        if self.files:
+                            self.filename = torrent_info.get('filename', f"magnet_{self.download_id}")
+
+                        # Get unrestricted links
+                        links = torrent_info.get('links', [])
+                        for link in links:
+                            unrestricted = self.rd_manager.unrestrict_link(link)
+                            self.download_links.append({
+                                'filename': unrestricted.get('filename', 'unknown'),
+                                'download': unrestricted.get('download'),
+                                'filesize': unrestricted.get('filesize', 0)
+                            })
+
+                        self.status = 'ready'
+                        self.progress = 100
+                        break
+                    elif torrent_status in ['magnet_error', 'error', 'virus']:
+                        raise Exception(f"Torrent error: {torrent_status}")
+                    elif torrent_status == 'dead':
+                        # Check if it's really dead or just slow
+                        seeders = torrent_info.get('seeders', 0)
+                        if seeders == 0 and check_count > 12:  # No seeders after 1 minute
+                            raise Exception(f"Torrent appears to be dead (no seeders)")
+                        else:
+                            self.error = f"Status: {torrent_status} - Seeders: {seeders} - Waiting for seeders..."
+                    elif torrent_status == 'waiting_files_selection':
+                        # Auto-select all files
+                        self.rd_manager.select_files(self.torrent_id)
+                    elif torrent_status in ['queued', 'downloading', 'compressing']:
+                        # Update progress based on download progress if available
+                        progress = torrent_info.get('progress', 0)
+                        self.progress = int(progress)
+
+                        # Add detailed status info
+                        seeders = torrent_info.get('seeders', 0)
+                        speed = torrent_info.get('speed', 0)
+                        size = torrent_info.get('bytes', 0)
+                        downloaded = torrent_info.get('bytes_done', 0)
+
+                        # Format speed
+                        speed_str = self._format_speed(speed)
+
+                        # Calculate ETA if speed > 0
+                        eta_str = ""
+                        if speed > 0 and size > downloaded:
+                            eta_seconds = (size - downloaded) / speed
+                            eta_str = f" - ETA: {self._format_time(eta_seconds)}"
+
+                        self.error = f"Status: {torrent_status} - Progress: {progress}% - Seeders: {seeders} - Speed: {speed_str}{eta_str}"
+                    else:
+                        # Unknown status, continue waiting
+                        self.error = f"Status: {torrent_status} - Check #{check_count}"
+
+                    # Wait before next check - longer intervals for long downloads
+                    if check_count < 12:  # First minute: check every 5 seconds
+                        time.sleep(5)
+                    elif check_count < 60:  # First 5 minutes: check every 10 seconds
+                        time.sleep(10)
+                    else:  # After 5 minutes: check every 30 seconds
+                        time.sleep(30)
+
+                except requests.exceptions.RequestException as e:
+                    # API error - wait and retry
+                    self.error = f"API Error (will retry): {str(e)}"
+                    time.sleep(60)  # Wait 1 minute before retrying on API errors
+                    continue
 
         except Exception as e:
             self.status = 'failed'
             self.error = str(e)
+
+    def _format_speed(self, bytes_per_second):
+        """Format speed in human readable format"""
+        if bytes_per_second == 0:
+            return "0 B/s"
+
+        units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
+        unit_index = 0
+        speed = float(bytes_per_second)
+
+        while speed >= 1024 and unit_index < len(units) - 1:
+            speed /= 1024
+            unit_index += 1
+
+        return f"{speed:.1f} {units[unit_index]}"
+
+    def _format_time(self, seconds):
+        """Format time in human readable format"""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
+        else:
+            days = int(seconds // 86400)
+            hours = int((seconds % 86400) // 3600)
+            return f"{days}d {hours}h"
 
 
 class DownloadManager:
@@ -165,11 +264,37 @@ class DownloadManager:
         """Download file in chunks with progress tracking"""
         try:
             self.status = 'downloading'
-            response = requests.get(self.url, stream=True, timeout=30)
-            response.raise_for_status()
+
+            # Try to establish connection with retries
+            max_attempts = 120  # 10 minutes max (5 seconds between attempts)
+            response = None
+
+            for attempt in range(max_attempts):
+                try:
+                    response = requests.get(self.url, stream=True, timeout=30)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.ConnectionError as e:
+                    self.error = f"Connection attempt {attempt + 1}/{max_attempts} failed"
+                    if attempt == max_attempts - 1:
+                        raise
+                    time.sleep(5)
+                except requests.exceptions.Timeout:
+                    self.error = f"Timeout attempt {attempt + 1}/{max_attempts}"
+                    if attempt == max_attempts - 1:
+                        raise
+                    time.sleep(5)
+
+            if not response:
+                raise Exception("Failed to connect after all attempts")
 
             # Get file size if available
             self.file_size = int(response.headers.get('content-length', 0))
+            self.error = None  # Clear any connection attempt messages
+
+            # Download with timeout handling
+            last_progress_time = time.time()
+            stall_timeout = 300  # 5 minutes without progress
 
             with open(self.filepath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
@@ -178,6 +303,13 @@ class DownloadManager:
                         self.downloaded_size += len(chunk)
                         if self.file_size > 0:
                             self.progress = int((self.downloaded_size / self.file_size) * 100)
+
+                        # Reset stall timer on progress
+                        last_progress_time = time.time()
+                    else:
+                        # Check for stalled download
+                        if time.time() - last_progress_time > stall_timeout:
+                            raise Exception("Download stalled - no progress for 5 minutes")
 
             self.status = 'completed'
             self.progress = 100
@@ -307,6 +439,14 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/status')
+def api_status():
+    """Check if Real-Debrid API is configured"""
+    return jsonify({
+        'real_debrid_configured': bool(REAL_DEBRID_API_KEY)
+    })
+
+
 @app.route('/download', methods=['POST'])
 def download_url():
     data = request.get_json()
@@ -429,6 +569,77 @@ def delete_file(download_id):
         del downloads[download_id]
 
     return jsonify({'success': True})
+
+
+@app.route('/torrents/active')
+def get_active_torrents():
+    """Get list of active torrents from Real-Debrid"""
+    if not REAL_DEBRID_API_KEY:
+        return jsonify({'error': 'Real-Debrid API key not configured'}), 500
+
+    try:
+        rd_manager = RealDebridManager(REAL_DEBRID_API_KEY)
+        response = requests.get(
+            f'{REAL_DEBRID_BASE_URL}/torrents',
+            headers=rd_manager.headers,
+            params={'limit': 100}
+        )
+        response.raise_for_status()
+        torrents = response.json()
+
+        # Filter and format active torrents
+        active_torrents = []
+        for torrent in torrents:
+            if torrent['status'] in ['downloading', 'queued', 'waiting_files_selection']:
+                active_torrents.append({
+                    'id': torrent['id'],
+                    'filename': torrent.get('filename', 'Unknown'),
+                    'status': torrent['status'],
+                    'progress': torrent.get('progress', 0),
+                    'seeders': torrent.get('seeders', 0),
+                    'size': torrent.get('bytes', 0),
+                    'added': torrent.get('added', '')
+                })
+
+        return jsonify({'torrents': active_torrents})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/resume/<torrent_id>', methods=['POST'])
+def resume_torrent_monitoring(torrent_id):
+    """Resume monitoring an existing Real-Debrid torrent"""
+    if not REAL_DEBRID_API_KEY:
+        return jsonify({'error': 'Real-Debrid API key not configured'}), 500
+
+    try:
+        # Create a new download entry for this torrent
+        download_id = hashlib.md5(f"resume_{torrent_id}_{time.time()}".encode()).hexdigest()[:12]
+
+        with download_lock:
+            # Create a special manager that resumes monitoring
+            manager = MagnetDownloadManager(f"resumed_torrent_{torrent_id}", download_id)
+            manager.torrent_id = torrent_id  # Set the existing torrent ID
+
+            downloads[download_id] = {
+                'id': download_id,
+                'url': f"Real-Debrid Torrent: {torrent_id}",
+                'filename': f"torrent_{torrent_id}",
+                'status': 'processing',
+                'progress': 0,
+                'start_time': datetime.now().isoformat(),
+                'manager': manager,
+                'type': 'magnet'
+            }
+
+        # Start monitoring in background thread
+        thread = threading.Thread(target=manager.process_magnet)
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({'success': True, 'download_id': download_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
