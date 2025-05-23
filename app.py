@@ -107,6 +107,7 @@ class MagnetDownloadManager:
         self.download_links = []
         self.files = []
         self.rd_manager = RealDebridManager(REAL_DEBRID_API_KEY)
+        self.filepath = None
 
     def process_magnet(self):
         """Process magnet link through Real-Debrid"""
