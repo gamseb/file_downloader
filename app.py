@@ -232,11 +232,14 @@ class MagnetDownloadManager:
                     torrent_status = torrent_info.get('status', 'unknown')
 
                     if torrent_status == 'downloaded':
-                        # Select all files
-                        self.rd_manager.select_files(self.torrent_id)
+                        # Select all files if not already done
+                        if not torrent_info.get('links'):
+                            self.rd_manager.select_files(self.torrent_id)
+                            # Wait a bit for the selection to take effect
+                            time.sleep(2)
+                            # Get updated torrent info with links
+                            torrent_info = self.rd_manager.get_torrent_info(self.torrent_id)
 
-                        # Get updated torrent info with links
-                        torrent_info = self.rd_manager.get_torrent_info(self.torrent_id)
                         self.files = torrent_info.get('files', [])
 
                         # Extract filename from torrent
@@ -245,18 +248,27 @@ class MagnetDownloadManager:
 
                         # Get unrestricted links
                         links = torrent_info.get('links', [])
-                        for link in links:
-                            unrestricted = self.rd_manager.unrestrict_link(link)
-                            self.download_links.append({
-                                'filename': unrestricted.get('filename', 'unknown'),
-                                'download': unrestricted.get('download'),
-                                'filesize': unrestricted.get('filesize', 0)
-                            })
+                        if links:
+                            self.download_links = []  # Clear existing links
+                            for link in links:
+                                try:
+                                    unrestricted = self.rd_manager.unrestrict_link(link)
+                                    self.download_links.append({
+                                        'filename': unrestricted.get('filename', 'unknown'),
+                                        'download': unrestricted.get('download'),
+                                        'filesize': unrestricted.get('filesize', 0)
+                                    })
+                                except Exception as e:
+                                    print(f"Failed to unrestrict link {link}: {e}")
+                                    continue
 
-                        self.status = 'ready'
-                        self.progress = 100
-                        save_downloads_index()  # Save completion
-                        break
+                            self.status = 'ready'
+                            self.progress = 100
+                            save_downloads_index()  # Save completion
+                            break
+                        else:
+                            self.error = "Torrent downloaded but no links available yet - waiting..."
+
                     elif torrent_status in ['magnet_error', 'error', 'virus']:
                         raise Exception(f"Torrent error: {torrent_status}")
                     elif torrent_status == 'dead':
@@ -267,8 +279,14 @@ class MagnetDownloadManager:
                         else:
                             self.error = f"Status: {torrent_status} - Seeders: {seeders} - Waiting for seeders..."
                     elif torrent_status == 'waiting_files_selection':
-                        # Auto-select all files
-                        self.rd_manager.select_files(self.torrent_id)
+                        # Auto-select all files and wait for confirmation
+                        self.error = f"Selecting files automatically..."
+                        try:
+                            self.rd_manager.select_files(self.torrent_id)
+                            self.error = f"Files selected - waiting for processing to continue..."
+                        except Exception as e:
+                            self.error = f"Failed to select files: {e}"
+                            # Continue waiting, might resolve itself
                     elif torrent_status in ['queued', 'downloading', 'compressing']:
                         # Update progress based on download progress if available
                         progress = torrent_info.get('progress', 0)
@@ -296,7 +314,7 @@ class MagnetDownloadManager:
                             save_downloads_index()
                     else:
                         # Unknown status, continue waiting
-                        self.error = f"Status: {torrent_status} - Check #{check_count}"
+                        self.error = f"Status: {torrent_status} - Check #{check_count} - Waiting..."
 
                     # Wait before next check - longer intervals for long downloads
                     if check_count < 12:  # First minute: check every 5 seconds
