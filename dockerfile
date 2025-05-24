@@ -28,6 +28,8 @@ RUN mkdir -p downloads .cache
 # Create non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser --no-create-home
 RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
 USER appuser
 
 # Set environment variables for yt-dlp cache
@@ -41,5 +43,5 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:5000/ || exit 1
 
-# Run the application
+# Run the application with explicit cache directory for yt-dlp
 CMD ["python", "app.py"]

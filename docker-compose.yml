@@ -8,10 +8,14 @@ services:
       - ./downloads:/app/downloads
       # Mount .env file if it exists
       - ./.env:/app/.env:ro
+      # Mount tmpfs for cache (non-persistent, in-memory)
+      - /app/.cache
     environment:
       # You can also set environment variables directly here
       # REAL_DEBRID_API_KEY: your_api_key_here
       - FLASK_ENV=production
+      - XDG_CACHE_HOME=/app/.cache
+      - HOME=/app
     restart: unless-stopped
     # Optional: set container name
     container_name: file_downloader
@@ -22,3 +26,6 @@ services:
           memory: 512M
         reservations:
           memory: 256M
+    tmpfs:
+      # Create in-memory filesystem for cache (non-persistent)
+      - /app/.cache:size=100M
