@@ -674,11 +674,12 @@ def delete_file(download_id):
         manager = downloads[download_id]['manager']
 
         # Delete file if it exists
-        if os.path.exists(manager.filepath):
-            try:
-                os.remove(manager.filepath)
-            except Exception as e:
-                return jsonify({'error': f'Failed to delete file: {str(e)}'}), 500
+        if manager.filepath is not None:
+            if os.path.exists(manager.filepath):
+                try:
+                    os.remove(manager.filepath)
+                except Exception as e:
+                    return jsonify({'error': f'Failed to delete file: {str(e)}'}), 500
 
         # Remove from downloads dict
         del downloads[download_id]
