@@ -1115,4 +1115,4 @@ if __name__ == '__main__':
 
     # For production on Debian, you might want to use gunicorn instead
     # Example: gunicorn -w 4 -b 0.0.0.0:8000 app:app
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)
