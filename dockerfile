@@ -16,6 +16,7 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir ffprobe
 
 # Copy application files
 COPY app.py .
@@ -24,6 +25,8 @@ COPY static/ static/
 
 # Create downloads directory and cache directory
 RUN mkdir -p downloads .cache
+RUN mkdir -p /app/.cache
+
 
 # Create non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser --no-create-home
