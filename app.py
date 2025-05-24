@@ -5,6 +5,8 @@ import threading
 import requests
 import hashlib
 import json
+import re
+import subprocess
 from flask import Flask, render_template, request, jsonify, send_file
 from datetime import datetime
 from urllib.parse import urlparse, unquote
@@ -30,6 +32,33 @@ downloads = {}
 download_lock = threading.Lock()
 
 
+def is_youtube_url(url):
+    """Check if URL is from YouTube"""
+    youtube_patterns = [
+        r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtu\.be/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/playlist\?list=[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/c/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/channel/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/@[\w-]+',
+    ]
+
+    for pattern in youtube_patterns:
+        if re.match(pattern, url, re.IGNORECASE):
+            return True
+    return False
+
+
+def check_yt_dlp_installed():
+    """Check if yt-dlp is installed and accessible"""
+    try:
+        result = subprocess.run(['yt-dlp', '--version'],
+                                capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 def save_downloads_index():
     """Save downloads dictionary to index file"""
     try:
@@ -53,7 +82,11 @@ def save_downloads_index():
                     # Magnet-specific fields
                     'torrent_id': getattr(manager, 'torrent_id', None),
                     'download_links': getattr(manager, 'download_links', []),
-                    'files': getattr(manager, 'files', [])
+                    'files': getattr(manager, 'files', []),
+                    # YouTube-specific fields
+                    'youtube_files': getattr(manager, 'youtube_files', []),
+                    'video_title': getattr(manager, 'video_title', ''),
+                    'video_duration': getattr(manager, 'video_duration', ''),
                 }
 
             with open(INDEX_FILE, 'w') as f:
@@ -82,6 +115,11 @@ def load_downloads_index():
                     manager.torrent_id = info.get('torrent_id')
                     manager.download_links = info.get('download_links', [])
                     manager.files = info.get('files', [])
+                elif info.get('type') == 'youtube':
+                    manager = YouTubeDownloadManager(info['url'], download_id)
+                    manager.youtube_files = info.get('youtube_files', [])
+                    manager.video_title = info.get('video_title', '')
+                    manager.video_duration = info.get('video_duration', '')
                 else:
                     manager = DownloadManager(info['url'], download_id)
                     manager.file_size = info.get('file_size', 0)
@@ -117,6 +155,8 @@ def load_downloads_index():
                     print(f"Resuming {info['type']} download: {info['filename']}")
                     if info.get('type') == 'magnet':
                         thread = threading.Thread(target=manager.process_magnet)
+                    elif info.get('type') == 'youtube':
+                        thread = threading.Thread(target=manager.download_youtube)
                     else:
                         thread = threading.Thread(target=manager.download)
                     thread.daemon = True
@@ -192,6 +232,199 @@ class RealDebridManager:
         )
         response.raise_for_status()
         return response.json()
+
+
+class YouTubeDownloadManager:
+    def __init__(self, url, download_id):
+        self.url = url
+        self.download_id = download_id
+        self.filename = f"youtube_{download_id}"
+        self.status = 'pending'
+        self.progress = 0
+        self.error = None
+        self.start_time = datetime.now()
+        self.youtube_files = []
+        self.video_title = ''
+        self.video_duration = ''
+        self.filepath = None
+
+    def download_youtube(self):
+        """Download YouTube video in both MP4 and MP3 formats"""
+        try:
+            self.status = 'processing'
+            self.error = "Getting video information..."
+            save_downloads_index()
+
+            # First, get video information
+            info_cmd = [
+                'yt-dlp',
+                '--print', '%(title)s',
+                '--print', '%(duration_string)s',
+                '--print', '%(id)s',
+                self.url
+            ]
+
+            result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=60)
+
+            if result.returncode != 0:
+                raise Exception(f"Failed to get video info: {result.stderr}")
+
+            lines = result.stdout.strip().split('\n')
+            if len(lines) >= 3:
+                self.video_title = lines[0]
+                self.video_duration = lines[1]
+                video_id = lines[2]
+                # Clean filename for filesystem
+                clean_title = "".join(c for c in self.video_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                self.filename = f"{clean_title} ({video_id})"
+
+            save_downloads_index()
+
+            mp4_success = False
+            mp3_success = False
+            download_errors = []
+
+            # Download MP4 (video)
+            self.error = "Downloading MP4..."
+            self.progress = 25
+            save_downloads_index()
+
+            try:
+                mp4_filename = f"{self.download_id}_video.%(ext)s"
+                mp4_filepath = os.path.join(DOWNLOAD_FOLDER, mp4_filename)
+
+                # Try different video format selectors for better compatibility
+                mp4_cmd = [
+                    'yt-dlp',
+                    '-f', 'best[height<=1080][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/best',
+                    '-o', mp4_filepath,
+                    '--no-playlist',
+                    '--merge-output-format', 'mp4',
+                    self.url
+                ]
+
+                print(f"Running MP4 command: {' '.join(mp4_cmd)}")
+                mp4_process = subprocess.run(mp4_cmd, capture_output=True, text=True, timeout=1800)
+
+                print(f"MP4 return code: {mp4_process.returncode}")
+                if mp4_process.stdout:
+                    print(f"MP4 stdout: {mp4_process.stdout}")
+                if mp4_process.stderr:
+                    print(f"MP4 stderr: {mp4_process.stderr}")
+
+                if mp4_process.returncode == 0:
+                    # Find the actual downloaded file
+                    mp4_actual_path = None
+                    for file in os.listdir(DOWNLOAD_FOLDER):
+                        if file.startswith(f"{self.download_id}_video."):
+                            mp4_actual_path = os.path.join(DOWNLOAD_FOLDER, file)
+                            break
+
+                    if mp4_actual_path and os.path.exists(mp4_actual_path):
+                        self.youtube_files.append({
+                            'type': 'video',
+                            'format': 'MP4',
+                            'filepath': mp4_actual_path,
+                            'filename': f"{clean_title}.mp4",
+                            'size': os.path.getsize(mp4_actual_path)
+                        })
+                        mp4_success = True
+                        print(f"MP4 download successful: {mp4_actual_path}")
+                    else:
+                        download_errors.append("MP4 file not found after download")
+                else:
+                    download_errors.append(
+                        f"MP4 download failed with return code {mp4_process.returncode}: {mp4_process.stderr}")
+
+            except subprocess.TimeoutExpired:
+                download_errors.append("MP4 download timed out")
+            except Exception as e:
+                download_errors.append(f"MP4 download error: {str(e)}")
+
+            # Update progress
+            self.progress = 50
+            save_downloads_index()
+
+            # Download MP3 (audio only)
+            self.error = "Downloading MP3..."
+            self.progress = 75
+            save_downloads_index()
+
+            try:
+                mp3_filename = f"{self.download_id}_audio.%(ext)s"
+                mp3_filepath = os.path.join(DOWNLOAD_FOLDER, mp3_filename)
+
+                mp3_cmd = [
+                    'yt-dlp',
+                    '-f', 'bestaudio/best',
+                    '--extract-audio',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '192K',
+                    '-o', mp3_filepath,
+                    '--no-playlist',
+                    self.url
+                ]
+
+                print(f"Running MP3 command: {' '.join(mp3_cmd)}")
+                mp3_process = subprocess.run(mp3_cmd, capture_output=True, text=True, timeout=1800)
+
+                print(f"MP3 return code: {mp3_process.returncode}")
+                if mp3_process.stdout:
+                    print(f"MP3 stdout: {mp3_process.stdout}")
+                if mp3_process.stderr:
+                    print(f"MP3 stderr: {mp3_process.stderr}")
+
+                if mp3_process.returncode == 0:
+                    # Find the actual downloaded file
+                    mp3_actual_path = None
+                    for file in os.listdir(DOWNLOAD_FOLDER):
+                        if file.startswith(f"{self.download_id}_audio.") and file.endswith('.mp3'):
+                            mp3_actual_path = os.path.join(DOWNLOAD_FOLDER, file)
+                            break
+
+                    if mp3_actual_path and os.path.exists(mp3_actual_path):
+                        self.youtube_files.append({
+                            'type': 'audio',
+                            'format': 'MP3',
+                            'filepath': mp3_actual_path,
+                            'filename': f"{clean_title}.mp3",
+                            'size': os.path.getsize(mp3_actual_path)
+                        })
+                        mp3_success = True
+                        print(f"MP3 download successful: {mp3_actual_path}")
+                    else:
+                        download_errors.append("MP3 file not found after download")
+                else:
+                    download_errors.append(
+                        f"MP3 download failed with return code {mp3_process.returncode}: {mp3_process.stderr}")
+
+            except subprocess.TimeoutExpired:
+                download_errors.append("MP3 download timed out")
+            except Exception as e:
+                download_errors.append(f"MP3 download error: {str(e)}")
+
+            # Determine final status
+            if mp4_success and mp3_success:
+                self.status = 'completed'
+                self.progress = 100
+                self.error = None
+            elif mp4_success or mp3_success:
+                self.status = 'completed'
+                self.progress = 100
+                self.error = f"Partial success. Errors: {'; '.join(download_errors)}"
+            else:
+                raise Exception(f"Both downloads failed. Errors: {'; '.join(download_errors)}")
+
+            save_downloads_index()
+
+        except subprocess.TimeoutExpired:
+            self.status = 'failed'
+            self.error = "Download timed out (30 minutes)"
+            save_downloads_index()
+        except Exception as e:
+            self.status = 'failed'
+            self.error = str(e)
+            save_downloads_index()
 
 
 class MagnetDownloadManager:
@@ -496,6 +729,10 @@ def start_download(url):
     """Start a new download in a separate thread"""
     download_id = hashlib.md5(f"{url}{time.time()}".encode()).hexdigest()[:12]
 
+    # Check if it's a YouTube URL
+    if is_youtube_url(url):
+        return start_youtube_download(url)
+
     with download_lock:
         manager = DownloadManager(url, download_id)
         downloads[download_id] = {
@@ -513,6 +750,36 @@ def start_download(url):
 
     # Start download in background thread
     thread = threading.Thread(target=manager.download)
+    thread.daemon = True
+    thread.start()
+
+    return download_id
+
+
+def start_youtube_download(url):
+    """Start processing a YouTube URL"""
+    if not check_yt_dlp_installed():
+        raise Exception("yt-dlp is not installed. Please install it with: pip install yt-dlp")
+
+    download_id = hashlib.md5(f"{url}{time.time()}".encode()).hexdigest()[:12]
+
+    with download_lock:
+        manager = YouTubeDownloadManager(url, download_id)
+        downloads[download_id] = {
+            'id': download_id,
+            'url': url,
+            'filename': manager.filename,
+            'status': manager.status,
+            'progress': manager.progress,
+            'start_time': manager.start_time.isoformat(),
+            'manager': manager,
+            'type': 'youtube'
+        }
+
+    save_downloads_index()  # Save new download
+
+    # Start processing in background thread
+    thread = threading.Thread(target=manager.download_youtube)
     thread.daemon = True
     thread.start()
 
@@ -556,9 +823,10 @@ def index():
 
 @app.route('/api/status')
 def api_status():
-    """Check if Real-Debrid API is configured"""
+    """Check if Real-Debrid API and yt-dlp are configured"""
     return jsonify({
-        'real_debrid_configured': bool(REAL_DEBRID_API_KEY)
+        'real_debrid_configured': bool(REAL_DEBRID_API_KEY),
+        'yt_dlp_available': check_yt_dlp_installed()
     })
 
 
@@ -624,6 +892,28 @@ def get_rd_links(download_id):
         })
 
 
+@app.route('/youtube-files/<download_id>')
+def get_youtube_files(download_id):
+    """Get YouTube download files for a completed download"""
+    with download_lock:
+        if download_id not in downloads:
+            return jsonify({'error': 'Download not found'}), 404
+
+        download_info = downloads[download_id]
+        if download_info.get('type') != 'youtube':
+            return jsonify({'error': 'Not a YouTube download'}), 400
+
+        manager = download_info['manager']
+        if manager.status != 'completed':
+            return jsonify({'error': 'YouTube download not completed yet'}), 400
+
+        return jsonify({
+            'video_title': manager.video_title,
+            'video_duration': manager.video_duration,
+            'files': manager.youtube_files
+        })
+
+
 @app.route('/status')
 def get_status():
     with download_lock:
@@ -645,6 +935,12 @@ def get_status():
                 data['download_links'] = manager.download_links
                 data['files_count'] = len(manager.download_links)
 
+            # Add YouTube specific info
+            if info.get('type') == 'youtube' and hasattr(manager, 'youtube_files'):
+                data['youtube_files'] = manager.youtube_files
+                data['video_title'] = getattr(manager, 'video_title', '')
+                data['video_duration'] = getattr(manager, 'video_duration', '')
+
             status_data[download_id] = data
     return jsonify({'downloads': status_data})
 
@@ -665,6 +961,40 @@ def download_file(download_id):
     return send_file(manager.filepath, as_attachment=True, download_name=manager.filename)
 
 
+@app.route('/download-youtube/<download_id>/<file_type>')
+def download_youtube_file(download_id, file_type):
+    """Download specific YouTube file (mp3 or mp4)"""
+    with download_lock:
+        if download_id not in downloads:
+            return jsonify({'error': 'Download not found'}), 404
+
+        download_info = downloads[download_id]
+        if download_info.get('type') != 'youtube':
+            return jsonify({'error': 'Not a YouTube download'}), 400
+
+        manager = download_info['manager']
+        if manager.status != 'completed':
+            return jsonify({'error': 'YouTube download not completed'}), 400
+
+        # Find the requested file type
+        target_file = None
+        for file_info in manager.youtube_files:
+            if file_type == 'mp3' and file_info['type'] == 'audio':
+                target_file = file_info
+                break
+            elif file_type == 'mp4' and file_info['type'] == 'video':
+                target_file = file_info
+                break
+
+        if not target_file:
+            return jsonify({'error': f'{file_type.upper()} file not found'}), 404
+
+        if not os.path.exists(target_file['filepath']):
+            return jsonify({'error': 'File not found on disk'}), 404
+
+    return send_file(target_file['filepath'], as_attachment=True, download_name=target_file['filename'])
+
+
 @app.route('/delete/<download_id>', methods=['DELETE'])
 def delete_file(download_id):
     with download_lock:
@@ -673,13 +1003,23 @@ def delete_file(download_id):
 
         manager = downloads[download_id]['manager']
 
-        # Delete file if it exists
-        if manager.filepath is not None:
-            if os.path.exists(manager.filepath):
-                try:
-                    os.remove(manager.filepath)
-                except Exception as e:
-                    return jsonify({'error': f'Failed to delete file: {str(e)}'}), 500
+        # Delete files based on download type
+        if downloads[download_id].get('type') == 'youtube':
+            # Delete all YouTube files
+            for file_info in getattr(manager, 'youtube_files', []):
+                if os.path.exists(file_info['filepath']):
+                    try:
+                        os.remove(file_info['filepath'])
+                    except Exception as e:
+                        print(f"Failed to delete YouTube file {file_info['filepath']}: {e}")
+        else:
+            # Delete regular file if it exists
+            if manager.filepath is not None:
+                if os.path.exists(manager.filepath):
+                    try:
+                        os.remove(manager.filepath)
+                    except Exception as e:
+                        return jsonify({'error': f'Failed to delete file: {str(e)}'}), 500
 
         # Remove from downloads dict
         del downloads[download_id]
@@ -765,6 +1105,13 @@ if __name__ == '__main__':
     # Load existing downloads on startup
     print("Loading downloads index...")
     load_downloads_index()
+
+    # Check if yt-dlp is available
+    if check_yt_dlp_installed():
+        print("yt-dlp is available - YouTube downloads enabled")
+    else:
+        print("yt-dlp not found - YouTube downloads will be disabled")
+        print("To enable YouTube downloads, install yt-dlp with: pip install yt-dlp")
 
     # For production on Debian, you might want to use gunicorn instead
     # Example: gunicorn -w 4 -b 0.0.0.0:8000 app:app
