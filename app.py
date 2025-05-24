@@ -41,6 +41,8 @@ def is_youtube_url(url):
         r'(?:https?://)?(?:www\.)?youtube\.com/c/[\w-]+',
         r'(?:https?://)?(?:www\.)?youtube\.com/channel/[\w-]+',
         r'(?:https?://)?(?:www\.)?youtube\.com/@[\w-]+',
+        r'(?:https?://)?(?:www\.)?stream\.cz/@[\w-]+',  # add support for streamCZ
+        r'(?:https?://)?(?:www\.)?vimeo\.com/@[\w-]+',  # add support for Vimeo
     ]
 
     for pattern in youtube_patterns:
