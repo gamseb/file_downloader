@@ -4,10 +4,11 @@ FROM python:3.11-slim-bookworm
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including ffmpeg
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -21,13 +22,17 @@ COPY app.py .
 COPY templates/ templates/
 COPY static/ static/
 
-# Create downloads directory
-RUN mkdir -p downloads
+# Create downloads directory and cache directory
+RUN mkdir -p downloads .cache
 
 # Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN groupadd -r appuser && useradd -r -g appuser appuser --no-create-home
 RUN chown -R appuser:appuser /app
 USER appuser
+
+# Set environment variables for yt-dlp cache
+ENV XDG_CACHE_HOME=/app/.cache
+ENV HOME=/app
 
 # Expose port
 EXPOSE 5000
@@ -35,10 +40,6 @@ EXPOSE 5000
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:5000/ || exit 1
-
-# Set yt-dlp cache to app directory instead of home
-ENV XDG_CACHE_HOME=/app/.cache
-RUN mkdir -p /app/.cache && chown -R appuser:appuser /app/.cache
 
 # Run the application
 CMD ["python", "app.py"]
