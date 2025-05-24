@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import subprocess
+import csv
 from flask import Flask, render_template, request, jsonify, send_file
 from datetime import datetime
 from urllib.parse import urlparse, unquote
@@ -20,6 +21,7 @@ app = Flask(__name__)
 # Configuration
 DOWNLOAD_FOLDER = 'downloads'
 INDEX_FILE = os.path.join(DOWNLOAD_FOLDER, 'index.json')
+LOG_FILE = os.path.join(DOWNLOAD_FOLDER, 'log.csv')
 CHUNK_SIZE = 8192  # 8KB chunks for downloading large files
 REAL_DEBRID_API_KEY = os.getenv('REAL_DEBRID_API_KEY')
 REAL_DEBRID_BASE_URL = 'https://api.real-debrid.com/rest/1.0'
@@ -30,6 +32,55 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 # Store download status and file information
 downloads = {}
 download_lock = threading.Lock()
+log_lock = threading.Lock()
+
+
+def log_download_start(download_type, url, download_id, client_ip, additional_data=None):
+    """Log download start to CSV file"""
+    try:
+        with log_lock:
+            # Check if log file exists and create header if needed
+            file_exists = os.path.exists(LOG_FILE)
+
+            with open(LOG_FILE, 'a', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['timestamp', 'ip', 'type', 'url', 'download_id', 'filename', 'user_agent',
+                              'additional_data']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                # Write header if file is new
+                if not file_exists:
+                    writer.writeheader()
+
+                # Prepare log entry
+                log_entry = {
+                    'timestamp': datetime.now().isoformat(),
+                    'ip': client_ip,
+                    'type': download_type,
+                    'url': url,
+                    'download_id': download_id,
+                    'filename': '',  # Will be updated when filename is determined
+                    'user_agent': request.headers.get('User-Agent', '') if request else '',
+                    'additional_data': json.dumps(additional_data) if additional_data else ''
+                }
+
+                writer.writerow(log_entry)
+
+    except Exception as e:
+        print(f"Error logging download start: {e}")
+
+
+def get_client_ip():
+    """Get the real client IP address, accounting for proxies"""
+    # Check for common proxy headers
+    if 'X-Forwarded-For' in request.headers:
+        # X-Forwarded-For can contain multiple IPs, use the first one
+        return request.headers['X-Forwarded-For'].split(',')[0].strip()
+    elif 'X-Real-IP' in request.headers:
+        return request.headers['X-Real-IP']
+    elif 'CF-Connecting-IP' in request.headers:  # Cloudflare
+        return request.headers['CF-Connecting-IP']
+    else:
+        return request.remote_addr
 
 
 def is_youtube_url(url):
@@ -677,9 +728,7 @@ class DownloadManager:
                     # For partial content, add the range to existing downloaded size
                     content_range = response.headers.get('content-range', '')
                     if '/' in content_range:
-                        self.file_size = int(content_range.split('/')[-1])
-                else:
-                    self.file_size = int(content_length)
+                        self.file_size = int(content_length)
 
             self.error = None  # Clear any connection attempt messages
 
@@ -730,6 +779,7 @@ class DownloadManager:
 def start_download(url):
     """Start a new download in a separate thread"""
     download_id = hashlib.md5(f"{url}{time.time()}".encode()).hexdigest()[:12]
+    client_ip = get_client_ip()
 
     # Check if it's a YouTube URL
     if is_youtube_url(url):
@@ -748,6 +798,13 @@ def start_download(url):
             'type': 'direct'
         }
 
+    # Log download start
+    additional_data = {
+        'file_size': getattr(manager, 'file_size', 0),
+        'parsed_domain': urlparse(url).netloc
+    }
+    log_download_start('direct', url, download_id, client_ip, additional_data)
+
     save_downloads_index()  # Save new download
 
     # Start download in background thread
@@ -764,6 +821,7 @@ def start_youtube_download(url):
         raise Exception("yt-dlp is not installed. Please install it with: pip install yt-dlp")
 
     download_id = hashlib.md5(f"{url}{time.time()}".encode()).hexdigest()[:12]
+    client_ip = get_client_ip()
 
     with download_lock:
         manager = YouTubeDownloadManager(url, download_id)
@@ -777,6 +835,13 @@ def start_youtube_download(url):
             'manager': manager,
             'type': 'youtube'
         }
+
+    # Log YouTube download start
+    additional_data = {
+        'platform': 'youtube',
+        'parsed_domain': urlparse(url).netloc
+    }
+    log_download_start('youtube', url, download_id, client_ip, additional_data)
 
     save_downloads_index()  # Save new download
 
@@ -794,6 +859,7 @@ def start_magnet_download(magnet_link):
         raise Exception("Real-Debrid API key not configured")
 
     download_id = hashlib.md5(f"{magnet_link}{time.time()}".encode()).hexdigest()[:12]
+    client_ip = get_client_ip()
 
     with download_lock:
         manager = MagnetDownloadManager(magnet_link, download_id)
@@ -807,6 +873,13 @@ def start_magnet_download(magnet_link):
             'manager': manager,
             'type': 'magnet'
         }
+
+    # Log magnet download start
+    additional_data = {
+        'service': 'real-debrid',
+        'hash': manager.rd_manager._extract_hash_from_magnet(magnet_link)
+    }
+    log_download_start('magnet', magnet_link, download_id, client_ip, additional_data)
 
     save_downloads_index()  # Save new download
 
@@ -1074,6 +1147,7 @@ def resume_torrent_monitoring(torrent_id):
     try:
         # Create a new download entry for this torrent
         download_id = hashlib.md5(f"resume_{torrent_id}_{time.time()}".encode()).hexdigest()[:12]
+        client_ip = get_client_ip()
 
         with download_lock:
             # Create a special manager that resumes monitoring
@@ -1090,6 +1164,14 @@ def resume_torrent_monitoring(torrent_id):
                 'manager': manager,
                 'type': 'magnet'
             }
+
+        # Log resumed torrent
+        additional_data = {
+            'service': 'real-debrid',
+            'torrent_id': torrent_id,
+            'resumed': True
+        }
+        log_download_start('magnet_resume', f"torrent:{torrent_id}", download_id, client_ip, additional_data)
 
         save_downloads_index()  # Save resumed download
 
@@ -1114,6 +1196,16 @@ if __name__ == '__main__':
     else:
         print("yt-dlp not found - YouTube downloads will be disabled")
         print("To enable YouTube downloads, install yt-dlp with: pip install yt-dlp")
+
+    # Initialize log file with header if it doesn't exist
+    if not os.path.exists(LOG_FILE):
+        print(f"Creating log file: {LOG_FILE}")
+        with open(LOG_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['timestamp', 'ip', 'type', 'url', 'download_id', 'filename', 'user_agent', 'additional_data']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+    else:
+        print(f"Log file exists: {LOG_FILE}")
 
     # For production on Debian, you might want to use gunicorn instead
     # Example: gunicorn -w 4 -b 0.0.0.0:8000 app:app
