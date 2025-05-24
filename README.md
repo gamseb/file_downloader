@@ -2,6 +2,8 @@
 
 A Flask-based web application for downloading files from multiple sources
 
+![img.png](images/img.png)
+
 ## Supported Sources
 
 - YouTube (videos, playlists, channels)
