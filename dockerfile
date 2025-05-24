@@ -36,5 +36,9 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:5000/ || exit 1
 
+# Set yt-dlp cache to app directory instead of home
+ENV XDG_CACHE_HOME=/app/.cache
+RUN mkdir -p /app/.cache && chown -R appuser:appuser /app/.cache
+
 # Run the application
 CMD ["python", "app.py"]
